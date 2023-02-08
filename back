@@ -1,0 +1,210 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+import socket
+from threading import Thread, Timer
+import rospy, cv2, cv_bridge, numpy
+import math
+from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped, Twist
+from nav_msgs.msg import Odometry
+import actionlib
+from move_base_msgs.msg import *
+from actionlib_msgs.msg import GoalID
+from sensor_msgs.msg import LaserScan
+import time 
+import tf
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String,Int32,Float64MultiArray, Bool, Float32
+from threading import Thread
+import sys
+import os
+import logging
+import subprocess
+
+train_to_map = {'j11':{'R':[3,'L'],'L':[5,'R']},
+                'j13':{'R':[6,'L'],'L':[4,'R']}, 
+                'j12':{'R':[5,'L'],'L':[8,'R']},
+                'j14':{'R':[4,'L'],'L':[1,'R']}}
+# 反向推导（可以程序计算） map 由车道和左右 推 铁道号
+map_to_train = {'6':{'R':'j15','L':'j13'},
+                '4':{'R':'j13','L':'j14'},
+                '1':{'R':'j14','L':'j15'},
+                '3':{'R':'j15','L':'j11'},
+                '5':{'R':'j11','L':'j12'},
+                '7':{'R':'j15','L':'j15'},
+                '8':{'R':'j12','L':'j15'}}
+tran_map = {'11':('5','R'),'12':('5','L'),'13':('4','R'),'14':('4','L'),}
+
+class robotClient:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.is_connected = False
+        self.timeout = 20 # 尝试重新连接时间s
+        self.heart_beat_rate = 10  # 心跳包发送间隔s
+        self.maxt = False  # 开始/停止巡检互斥量
+        self.heart_beat_data = {"ID": "00000002", "RgvCurrentRunSpeed": "799", "RgvCurrentRunDistacnce": "15100",
+                 "RgvCurrentPowerStat": "0", "RgvCurrentPowerElectricity": "99",
+                 "RgvCurrentPowerCurrent": "20", "RgvCurrentPowerTempture": "35", "RgvCurrentMode": "自动模式",
+                 "RgvCurrentStat": "", "RgvCurrentCmdSetStat": "", "RgvCurrentParaSetStat": "", "RgvIsAlarm": "0",
+                 "RgvIsStandby": "0", "RgvTargetRunSpeed": "800",
+                 "RgvTargetRunDistance": "250000", "RgvTrackLength": "300000", "RgvRunStatMonitor": "RUN", }
+        self.socket_cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        self.led_ctrl_pub = rospy.Publisher("/rayBase/cmd", String, queue_size=1)
+        self.lifter_pub = rospy.Publisher('/lifter/cmd', String, queue_size = 1)
+        self.car_log_pub = rospy.Publisher('/car_state/log',String,queue_size = 2)
+        self.car_status_stop_pub = rospy.Publisher('/car_state/stop', Int32, queue_size= 1)
+
+
+        self.connect()
+
+    def connect(self):
+        cnt = 0
+        while not self.is_connected and not rospy.is_shutdown():
+            try:
+                self.socket_cli.connect((self.host, self.port))
+                self.is_connected = True
+                cnt = 0
+            except:
+                cnt += 1
+                time.sleep(self.timeout)
+                logging.info('尝试重新连接...')
+                print('尝试重新连接...')
+                if cnt*self.timeout > 60*2:
+                    logging.info('多次请求重新连接失败')
+                    print('多次请求重新连接失败')
+                    #TODO 发布一个log 显示连接失败 检查服务器或网络
+                    rospy.signal_shutdown('连接失败 通过launch文件 设置重复连接')
+
+
+    def heart_beat(self):
+        # 更新数据
+        self.heart_beat_data['RgvCurrentPowerCurrent'] = 25
+        self.send('START/' + 'robot_state' + '/' + str(self.heart_beat_data) + '/END')
+        Timer(self.heart_beat_rate, self.heart_beat).start()
+
+    def parsel(self, msg):
+        global led_ctrl_pub
+        print(msg)
+        if 'start_work' in msg:
+            print('start work')
+            if not self.maxt:
+                self.maxt = True
+                #self.start_work(str(road_))
+
+        elif 'stop_work' in msg:
+            self.maxt = False
+            # 终止的操作
+        elif 'pause' in msg:
+            # 暂停操作
+            pass
+        
+
+
+    def recv(self):
+        while self.is_connected:
+            data_rev = self.socket_cli.recv(1024).decode('utf-8')
+            if data_rev:
+                self.parsel(data_rev)
+            else:
+                # 说明断开了了连接
+                rospy.signal_shutdown('连接断开 通过launch文件 设置重复连接')
+                self.close()
+                #  尝试重新连接
+                break
+
+    def send(self, msg):
+        self.socket_cli.send(msg.encode('utf-8'))
+        print(str(msg) + '-send')
+
+    def close(self):
+        self.is_connected = False
+        self.socket_cli.close()
+
+    def start_work(self,road_t):
+        time.sleep(0.1)
+        self.send('START/' + 'start_work' + '/' + 'true' + '/END')
+        if road_t not in tran_map.keys():
+          return
+        road = tran_map[road_t][0]
+        side = tran_map[road_t][1]
+        intervel = '80'
+        num = '100'
+        
+        self.led_ctrl_pub.publish('init')
+        time.sleep(0.3)
+        self.led_ctrl_pub.publish('greenBlink')
+        map_path = 'map_file:=/home/fa/robot_ws/src/huanyu_robot_start/map/map'+str(road)+'.yaml'
+        map_server = subprocess.Popen(['roslaunch','huanyu_robot_start','navigation_slam.launch',map_path])
+        logging.info('切换地图中')
+        
+        #TODO 看修改
+        #self.close()
+
+        time.sleep(30)
+        #TODO 点数
+        num = 10
+        contents = []
+        road_path = '/home/fa/cfg/det_every_cfg/road_'+str(road)+'.cfg'
+        with open(road_path) as f:
+          contents = f.readline().split(' ')
+        intervel = contents[0]
+        num = contents[1]
+        print(str(road)+' '+intervel+' '+num+' '+side)
+        # num_path = '/home/fa/cfg/det_every_cfg/point_num_'+str(road)+'.cfg'
+        # with open(num_path) as f:
+        #     content2 = f.read()
+        #     num = int(content2.strip('\n'))
+        start_server = subprocess.Popen(['rosrun','huanyu_robot_start','nav_det_with_line.py',str(road), str(intervel), str(num), str(side)])
+        logging.info('开始巡检')
+
+    def stop_work(self):
+        self.send('START/' + 'stop_work' + '/' + 'true' + '/END')
+        # 发布停车指令
+    
+    def pause_work(self):
+        self.car_status_stop_pub.publish(1)
+
+def shutdown():
+    logging.info('结点被终止')
+    print('结点被终止')
+    mysocket.close()
+    exit(0)
+
+if __name__ == '__main__':
+    rospy.init_node('socket_cli')
+    rospy.on_shutdown(shutdown)
+    flag_ = True
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers:
+        root_logger.removeHandler(h)
+    logging.basicConfig(format='%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s',
+                        level=logging.INFO,
+                        filename='/home/fa/socket_cli'+'.log',
+                        filemode='w')
+
+    logging.info('初始化结点成功 开始连接服务器')
+    print('初始化结点成功 开始连接服务器')
+    mysocket = robotClient('101.35.202.172', 10010)
+    if mysocket.is_connected:
+        logging.info('连接成功')
+        print('连接成功')
+        rv = Thread(target=mysocket.recv)
+        rv.setDaemon(True)
+        rv.start()
+        # 发布上线命令
+        key = 'robot_online'
+        value = '00000002'
+        robot_online = 'START/' + key + '/' + value + '/END'
+        mysocket.send(robot_online)
+        time.sleep(1)
+        Timer(0, mysocket.heart_beat).start()
+    else:
+        #TODO 发送连接失败的标识
+        print('连接失败')
+
+
+    rospy.spin()
+
